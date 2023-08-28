@@ -5,6 +5,8 @@
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
+use embassy_futures::select::{select, Either};
+
 use embassy_time::{Duration, Timer};
 
 use embassy_rp::gpio::{Input, Level, Output, Pull};
@@ -23,6 +25,39 @@ use {defmt_rtt as _, panic_probe as _};
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
+
+struct DebouncedInput<T: embedded_hal_async::digital::Wait, const MS: u64 = 10> {
+    pin: T,
+}
+
+impl<T, const MS: u64> DebouncedInput<T, MS>
+where
+    T: embedded_hal_async::digital::Wait,
+{
+    pub fn new(pin: T) -> Self {
+        Self { pin }
+    }
+
+    pub async fn wait_for_high(&mut self) {
+        loop {
+            self.pin.wait_for_high().await;
+            match select(self.pin.wait_for_low(), Timer::after(Duration::from_millis(MS))).await {
+                Either::First(_) => continue,
+                Either::Second(_) => break,
+            }
+        }
+    }
+
+    pub async fn wait_for_low(&mut self) {
+        loop {
+            self.pin.wait_for_low().await;
+            match select(self.pin.wait_for_high(), Timer::after(Duration::from_millis(MS))).await {
+                Either::First(_) => continue,
+                Either::Second(_) => break,
+            }
+        }
+    }
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -72,7 +107,8 @@ async fn main(_spawner: Spawner) {
     // Run the USB device.
     let usb_fut = usb.run();
 
-    let mut button = Input::new(p.PIN_20, Pull::Up);
+    let button_raw = Input::new(p.PIN_20, Pull::Up);
+    let mut button = DebouncedInput::<_>::new(button_raw);
 
     let (_, mut writer) = hid.split();
 
